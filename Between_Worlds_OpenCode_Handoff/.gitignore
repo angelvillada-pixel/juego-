@@ -1,0 +1,17 @@
+# Godot 4
+.godot/
+export_presets.cfg
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Builds / misc
+/bin/
+/logs/

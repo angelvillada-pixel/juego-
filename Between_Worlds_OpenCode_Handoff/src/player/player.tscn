@@ -1,0 +1,21 @@
+[gd_scene load_steps=3 format=3]
+
+[ext_resource type="Script" path="res://src/player/player.gd" id="1"]
+
+[sub_resource type="RectangleShape2D" id="shape_body"]
+size = Vector2(12, 24)
+
+[node name="Player" type="CharacterBody2D"]
+script = ExtResource("1")
+collision_layer = 2
+collision_mask = 1
+
+[node name="CollisionShape2D" type="CollisionShape2D" parent="."]
+shape = SubResource("shape_body")
+position = Vector2(0, -12)
+
+[node name="WeaponArm" type="Node2D" parent="."]
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position_smoothing_enabled = true
+position_smoothing_speed = 8.0

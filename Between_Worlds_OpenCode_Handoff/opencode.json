@@ -1,0 +1,9 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "./AGENTS.md",
+    "./docs/MASTER_DESIGN.md",
+    "./docs/DECISIONS.md",
+    "./docs/OPEN_QUESTIONS.md"
+  ]
+}
