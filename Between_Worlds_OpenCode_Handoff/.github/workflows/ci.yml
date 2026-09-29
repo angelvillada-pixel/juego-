@@ -3,6 +3,7 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_call:  # P3-P5: deploy.yml reutiliza verify
 
 jobs:
   verify:
@@ -18,7 +19,7 @@ jobs:
           chmod +x /tmp/godot
 
       - name: Launch check (headless)
-        run: /tmp/godot --headless --path . --quit
+        run: /tmp/godot --headless --path Between_Worlds_OpenCode_Handoff --quit
 
       - name: Unit tests
-        run: /tmp/godot --headless --path . -s res://tests/run_tests.gd
+        run: /tmp/godot --headless --path Between_Worlds_OpenCode_Handoff -s res://tests/run_tests.gd

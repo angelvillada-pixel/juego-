@@ -9,32 +9,57 @@ const DEFAULT_PORT := WsTransport.DEFAULT_PORT
 var world: TestMap = null
 var _quit_after := 0.0  # 0 = sin límite (servidor real)
 var _elapsed := 0.0
+var _booted := false
+var _port := 26500
+var _mode := ""
+var _map_id := ""
+var _bind_addr := "127.0.0.1"
+
+# S1/P1-P2: con `-s` el script se compila antes de que existan los autoloads,
+# así que se resuelven en runtime (igual que tests/run_tests.gd).
+var Server: Node
+var MatchNode: Node
+var TelemetryNode: Node
 
 
 func _initialize() -> void:
+	Server = root.get_node("Server")
+	MatchNode = root.get_node("Match")
+	TelemetryNode = root.get_node("Telemetry")
 	var args := OS.get_cmdline_user_args()
-	var port := _arg_int(args, "port", DEFAULT_PORT)
+	_port = _arg_int(args, "port", DEFAULT_PORT)
 	_quit_after = _arg_float(args, "seconds", 0.0)
-	var mode := _arg_str(args, "mode", ModeData.MODE_FRONTLINE)
-	var map_id := _arg_str(args, "map", MapData.MAP_LAB)
-	_build_world(map_id)
+	_mode = _arg_str(args, "mode", ModeData.MODE_FRONTLINE)
+	_map_id = _arg_str(args, "map", MapData.MAP_LAB)
+	_bind_addr = _arg_str(args, "bind", "127.0.0.1")
+
+
+func _boot() -> bool:
+	# P1-P2: en el primer frame el árbol ya está listo y add_child dispara
+	# _ready de forma síncrona (en _initialize el grid aún sería null).
+	_build_world(_map_id)
 	Server.register_world(world, world.grid)
-	Server.set_mode(mode if ModeData.is_valid(mode) else ModeData.MODE_FRONTLINE)
-	Match.round_active = true  # marcar la ronda activa para la simulación
-	Telemetry.start_session(Server.mode_id, world.map_id)
-	if not Server.start_listener(port):
+	Server.set_mode(_mode if ModeData.is_valid(_mode) else ModeData.MODE_FRONTLINE)
+	MatchNode.set("round_active", true)  # marcar la ronda activa para la simulación
+	TelemetryNode.call("start_session", Server.get("mode_id"), world.map_id)
+	if not Server.start_listener(_port, _bind_addr):
 		quit(1)
-		return
-	print("[server_main] mundo listo (%s, %s), %d objetivos, escuchando en ws://0.0.0.0:%d" % [Server.mode_id, world.map_id, world.objectives_total, port])
+		return false
+	print("[server_main] mundo listo (%s, %s), %d objetivos, escuchando en ws://%s:%d" % [Server.get("mode_id"), world.map_id, world.objectives_total, _bind_addr, _port])
+	return true
 
 
 func _process(delta: float) -> bool:
+	if not _booted:
+		_booted = true
+		if not _boot():
+			return true  # listener caído: salir
 	_elapsed += delta
 	_check_falls()
 	if _quit_after > 0.0 and _elapsed >= _quit_after:
 		print("[server_main] fin programado alcanzado")
-		Telemetry.end_session("shutdown")
-		Telemetry.flush()
+		TelemetryNode.call("end_session", "shutdown")
+		TelemetryNode.call("flush")
 		return true  # true = pedir salida
 	return false
 

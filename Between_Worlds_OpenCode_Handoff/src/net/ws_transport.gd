@@ -11,11 +11,26 @@ var peer: WebSocketPeer = null
 var _was_open := false
 
 
+## S2: normaliza direcciones del menú/CLI ("host:port" -> "ws://host:port").
+static func normalize_url(url: String) -> String:
+	var u := url.strip_edges()
+	if u.is_empty():
+		return u
+	if u.contains("://"):
+		return u
+	return "ws://" + u
+
+
+## S2: true si la URL va cifrada (obligatorio en producción tras Caddy).
+static func is_secure(url: String) -> bool:
+	return normalize_url(url).begins_with("wss://")
+
+
 ## Modo cliente.
 func connect_to_server(url: String) -> bool:
 	close()
 	peer = WebSocketPeer.new()
-	var err := peer.connect_to_url(url)
+	var err := peer.connect_to_url(normalize_url(url))
 	if err != OK:
 		peer = null
 		return false

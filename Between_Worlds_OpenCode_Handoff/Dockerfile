@@ -1,6 +1,7 @@
 # Servidor dedicado de Between Worlds (Godot 4.7.2 headless).
-# Uso: docker build -t between-worlds-server . && docker run -p 26500:26500 between-worlds-server
-# Ver docs/DEPLOY.md.
+# Uso directo (solo LAN/dev): docker build -t between-worlds-server . && docker run -p 127.0.0.1:26500:26500 between-worlds-server
+# Producción (wss:// obligatorio): docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+# Ver docs/DEPLOY.md. El 26500 NUNCA se publica a internet sin Caddy delante.
 
 FROM ubuntu:24.04 AS fetch
 ARG GODOT_VERSION=4.7.2
@@ -20,4 +21,6 @@ WORKDIR /game
 USER bw
 EXPOSE 26500
 ENTRYPOINT ["godot", "--headless", "--path", "/game", "-s", "res://src/server/server_main.gd", "--"]
-CMD ["--port=26500", "--mode=frontline", "--map=lab"]
+# S2: dentro de compose Caddy alcanza al juego por la red del compose, así que
+# el bind es 0.0.0.0 del contenedor; el compose solo publica 127.0.0.1:26500.
+CMD ["--port=26500", "--bind=0.0.0.0", "--mode=frontline", "--map=lab"]

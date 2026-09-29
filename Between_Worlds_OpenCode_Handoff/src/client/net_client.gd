@@ -21,23 +21,50 @@ var last_server_tick := 0  # Punto 3: último tick visto (se reenvía como ftick
 var _move_accum := 0.0
 var _remote_puppets: Dictionary = {}   # id -> RemotePuppet
 var _applied_api_url := ""
+# S3: credenciales para el login (las pone main.gd desde el menú).
+var auth_callsign := ""
+var auth_password := ""
+var auth_register := false
+signal auth_failed(reason: String)
 
 
-func setup(p_player: Player, p_map: TestMap, p_match: Node) -> void:
+func setup(p_player: Player, p_map: TestMap, p_match: Node, p_callsign: String = "", p_password: String = "", p_register: bool = false) -> void:
 	player = p_player
 	test_map = p_map
 	match_ref = p_match
+	auth_callsign = p_callsign
+	auth_password = p_password
+	auth_register = p_register
 
 
 func connect_to(url: String) -> void:
 	var ws := WsTransport.new()
 	Client.setup(ws)
 	ws.message_received.connect(_on_server_message)
-	ws.connected.connect(func() -> void: print("[NetClient] conectado a %s" % url))
+	ws.connected.connect(_on_ws_connected.bind(url))
 	ws.disconnected.connect(_on_disconnected)
 	_applied_api_url = url
+	# S2: en web el navegador bloquea ws:// mixto; avisar antes del error críptico.
+	if OS.has_feature("web") and not WsTransport.is_secure(url):
+		push_error("NetClient: en web usa wss:// (el navegador bloquea ws:// sin cifrar)")
+		return
 	if not ws.connect_to_server(url):
 		push_error("NetClient: no se pudo iniciar conexión %s" % url)
+
+
+# S3: al conectar se intenta JOIN con el token guardado; si no hay,
+# REGISTER/LOGIN con las credenciales del menú y JOIN al recibir AUTH_OK.
+func _on_ws_connected(url: String) -> void:
+	print("[NetClient] conectado a %s" % url)
+	var saved: String = Backend.auth_token
+	if saved != "":
+		Client.send({"type": NetMsg.JOIN, "token": saved, "callsign": auth_callsign})
+	elif auth_callsign != "":
+		if auth_register:
+			Client.send({"type": NetMsg.AUTH_REGISTER, "callsign": auth_callsign, "password": auth_password})
+		else:
+			Client.send({"type": NetMsg.AUTH_LOGIN, "callsign": auth_callsign, "password": auth_password})
+	auth_password = ""  # nunca retener el password en memoria más de lo necesario
 
 
 func _process(delta: float) -> void:
@@ -72,6 +99,9 @@ func _on_server_message(msg: Dictionary) -> void:
 		NetMsg.WELCOME:
 			my_id = int(msg.get("id", -1))
 			my_team = int(msg.get("team", 0))
+			var server_proto := int(msg.get("proto", NetMsg.PROTOCOL_VERSION))
+			if server_proto != NetMsg.PROTOCOL_VERSION:
+				push_warning("[NetClient] servidor con protocolo %d (local %d): actualiza el juego" % [server_proto, NetMsg.PROTOCOL_VERSION])
 			var spawn: Array = msg.get("spawn", [256.0, 256.0])
 			player.global_position = Vector2(spawn[0], spawn[1])
 			player.team_id = my_team
@@ -118,6 +148,13 @@ func _on_server_message(msg: Dictionary) -> void:
 			if match_ref != null and ModeData.is_valid(str(msg.get("mode", ""))):
 				match_ref.mode_id = str(msg.get("mode"))
 				match_ref.emit_signal("mode_changed", match_ref.mode_id)
+		NetMsg.AUTH_OK:
+			Backend.set_auth_token(str(msg.get("token", "")))
+			Backend.set_callsign(str(msg.get("callsign", auth_callsign)))
+			Client.send({"type": NetMsg.JOIN, "token": Backend.auth_token, "callsign": auth_callsign})
+		NetMsg.AUTH_FAIL:
+			Backend.clear_auth_token()
+			emit_signal("auth_failed", str(msg.get("reason", "error")))
 
 
 func _apply_snapshot(players: Dictionary) -> void:

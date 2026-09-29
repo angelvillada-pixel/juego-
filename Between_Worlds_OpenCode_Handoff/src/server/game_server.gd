@@ -21,6 +21,25 @@ const HISTORY_MAX := 90  # ~3 s de historial a 30 Hz
 const SPEED_CAP := 1200.0  # muy por encima de lo legítimo (dash 380 + caída 900)
 const CHEAT_LOG_MAX := 200
 
+# S1: endurecimiento de entrada y sesiones (provisionales, ver docs/DECISIONS.md).
+const MAX_PENDING_PEERS := 16  # handshakes a medias en espera, como máximo
+const HANDSHAKE_TIMEOUT_SEC := 10.0  # handshake que no abre en 10 s => fuera
+const IDLE_KICK_SEC := 300.0  # sesión de red 5 min sin intents => kick
+const REORDER_SLACK_MS := 1000  # holgura de reorden en el reloj del cliente
+const MAX_PATH_LEN := 128  # longitud máxima de path en PICKUP_CLAIM
+
+# S2: TLS termina en el proxy (Caddy); Godot escucha en localhost por defecto
+# y limita el ritmo de aceptadas contra floods de conexión.
+const ACCEPT_BURST := 10.0
+const ACCEPT_RATE_PER_SEC := 10.0
+
+# S3: cuentas completas (provisionales, ver docs/DECISIONS.md).
+# TTL de tokens en AuthService.TOKEN_TTL_SEC (24 h).
+const AUTH_TIMEOUT_SEC := 30.0  # pendiente sin REGISTER/LOGIN/JOIN => fuera
+const PASSWORD_MIN_LEN := 8
+const MAX_LOGIN_FAILS := 5  # => bloqueo 15 min
+const LOGIN_LOCK_SEC := 900.0
+
 const BLOCK_SCENE := preload("res://src/construction/block.tscn")
 
 ## Contenedor del mundo autoritativo y su grid.
@@ -33,8 +52,10 @@ var is_dedicated_server := false
 var _sessions: Dictionary = {}
 var _next_player_id := 1
 var _listener: TCPServer = null
-var _pending_peers: Array[WebSocketPeer] = []
+var _pending_peers: Array = []  # S1: Array[{ws: WebSocketPeer, t: float}]
 var _snapshot_accum := 0.0
+var _accept_limiter := RateLimiter.new(ACCEPT_BURST, ACCEPT_RATE_PER_SEC)  # S2
+var _accept_flood_last_log := -60.0  # S2: no spamear el cheat_log
 
 # Punto 2: modo de partida + estado de equipos (autoridad del servidor).
 var mode_id := ModeData.MODE_FRONTLINE
@@ -47,7 +68,22 @@ var server_tick := 0
 var cheat_log: Array[Dictionary] = []  # {tick, id, kind} (capado)
 var _histories := {}  # session id -> Array[[tick, x, y]] (capado a HISTORY_MAX)
 
+# S3: cuentas. _users: key -> {callsign, salt, hash, iter, created}.
+# _tokens: token -> {callsign, exp}. _failed: key -> {n, until}.
+# _pending_auth: transport -> {t, rl, callback, fails}.
+var _users := {}
+var _users_path := "user://auth_users.jsonl"
+var _tokens := {}
+var _failed := {}
+var _pending_auth := {}
+var __auth_secret_cache := PackedByteArray()
+var _secret_path := "user://server_secret"
+
 signal player_joined_net(player_id: int)
+
+
+func _ready() -> void:
+	_auth_load()
 
 
 func _process(delta: float) -> void:
@@ -118,14 +154,14 @@ func _on_grid_block_removed(cell: Vector2i) -> void:
 # ---------------------------------------------------------------
 # Listener dedicado (Etapa 3)
 
-func start_listener(port: int) -> bool:
+func start_listener(port: int, bind_addr: String = "127.0.0.1") -> bool:
 	_listener = TCPServer.new()
-	if _listener.listen(port) != OK:
-		push_error("No se pudo escuchar en el puerto %d" % port)
+	if _listener.listen(port, bind_addr) != OK:
+		push_error("No se pudo escuchar en %s:%d" % [bind_addr, port])
 		_listener = null
 		return false
 	is_dedicated_server = true
-	print("[Server] WebSocket escuchando en puerto %d" % port)
+	print("[Server] WebSocket escuchando en %s:%d (detrás de TLS: ver deploy/Caddyfile)" % [bind_addr, port])
 	return true
 
 
@@ -139,13 +175,22 @@ func stop_listener() -> void:
 func _poll_network(_delta: float) -> void:
 	if _listener == null:
 		return
+	var now := _now_sec()
 	while _listener.is_connection_available():
+		# S2: budget de aceptadas; el exceso espera (y caduca por prune_pending).
+		if not _accept_limiter.consume(1.0, now):
+			if now - _accept_flood_last_log >= 1.0:
+				_accept_flood_last_log = now
+				_log_cheat(0, "accept_flood")
+			break
 		var stream := _listener.take_connection()
 		var ws := WebSocketPeer.new()
 		ws.accept_stream(stream)
-		_pending_peers.append(ws)
-	var still_pending: Array[WebSocketPeer] = []
-	for ws in _pending_peers:
+		_pending_peers.append({"ws": ws, "t": now})
+	_pending_peers = prune_pending(_pending_peers, _now_sec())
+	var still_pending: Array = []
+	for entry in _pending_peers:
+		var ws: WebSocketPeer = entry["ws"]
 		ws.poll()
 		match ws.get_ready_state():
 			WebSocketPeer.STATE_OPEN:
@@ -153,22 +198,44 @@ func _poll_network(_delta: float) -> void:
 			WebSocketPeer.STATE_CLOSED:
 				pass  # handshake fallido: se descarta
 			_:
-				still_pending.append(ws)
+				still_pending.append(entry)
 	_pending_peers = still_pending
+
+
+## S1: purga handshakes caducados y capa la cola de pendientes.
+## Pura respecto a la decisión (solo cierra peers sobrantes/caducados).
+static func prune_pending(peers: Array, now_sec: float) -> Array:
+	var fresh: Array = []
+	for e in peers:
+		if e is Dictionary and now_sec - float(e.get("t", now_sec)) <= HANDSHAKE_TIMEOUT_SEC:
+			fresh.append(e)
+		elif e is Dictionary and e.get("ws") is WebSocketPeer:
+			(e["ws"] as WebSocketPeer).close()
+	while fresh.size() > MAX_PENDING_PEERS:
+		var dropped: Dictionary = fresh.pop_front()
+		if dropped.get("ws") is WebSocketPeer:
+			(dropped["ws"] as WebSocketPeer).close()
+	return fresh
 
 
 func _adopt_peer(ws: WebSocketPeer) -> void:
 	if count_net_players() >= MAX_NET_PLAYERS:
 		ws.close()
 		return
-	var transport := WsTransport.from_accepted_peer(ws)
-	var player := _spawn_net_player()
-	if player == null:
+	if _pending_auth.size() >= MAX_PENDING_PEERS:
 		ws.close()
 		return
-	attach_transport(transport, player, true)
-	var session: Dictionary = _sessions[transport]
-	transport.send(_welcome_msg(session["id"], player))
+	# S3: la conexión nace SIN jugador. Solo REGISTER/LOGIN/JOIN hablan aquí;
+	# el spawn ocurre en _auth_do_join con token válido.
+	var transport := WsTransport.from_accepted_peer(ws)
+	var cb := _on_pre_auth_message.bindv([transport])
+	_pending_auth[transport] = {
+		"t": _now_sec(),
+		"rl": RateLimiter.new(5.0, 0.5),
+		"callback": cb,
+		"fails": 0,
+	}
+	transport.message_received.connect(cb)
 
 
 func count_net_players() -> int:
@@ -180,7 +247,7 @@ func count_net_players() -> int:
 
 
 func _welcome_msg(id: int, player: Player) -> Dictionary:
-	return {"type": NetMsg.WELCOME, "id": id, "spawn": [player.global_position.x, player.global_position.y], "team": player.team_id}
+	return {"type": NetMsg.WELCOME, "id": id, "spawn": [player.global_position.x, player.global_position.y], "team": player.team_id, "proto": NetMsg.PROTOCOL_VERSION}
 
 
 # ---------------------------------------------------------------
@@ -197,6 +264,8 @@ func attach_transport(transport: NetTransport, player: Player, net := false) -> 
 		"id": _next_player_id if net else 0,
 		"lives": GameConstants.STARTING_LIVES,
 		"last_seq": 0,  # Punto 3: último seq visto (para el ack del snapshot)
+		"last_t": 0,  # S1: último reloj de cliente visto (anti-replay)
+		"last_input_t": _now_sec(),  # S1: último intent aceptado (idle kick)
 		"strikes": 0,  # Punto 3: infracciones acumuladas (kick al llegar al tope)
 		"limiters": _new_limiters(),  # Punto 3: token buckets por tipo de intent
 		"last_pos": player.global_position,  # Punto 3: control de velocidad
@@ -220,16 +289,50 @@ func clear_sessions() -> void:
 		if transport.message_received.is_connected(cb):
 			transport.message_received.disconnect(cb)
 	_sessions.clear()
+	_histories.clear()  # S1: sin sesiones no hay a quién rebobinar
+	for transport: NetTransport in _pending_auth.keys():
+		_drop_pending(transport)
+
+
+func _drop_pending(transport: NetTransport) -> void:
+	var entry: Dictionary = _pending_auth.get(transport, {})
+	var cb: Callable = entry.get("callback", Callable())
+	if cb.is_valid() and transport.message_received.is_connected(cb):
+		transport.message_received.disconnect(cb)
+	_pending_auth.erase(transport)
 
 
 func _poll_sessions(delta: float) -> void:
+	var now := _now_sec()
 	var dropped: Array[NetTransport] = []
 	for transport: NetTransport in _sessions.keys():
+		var session: Dictionary = _sessions[transport]
 		transport.poll(delta)
-		if _sessions[transport]["net"] and not transport.is_open():
+		if not bool(session.get("net", false)):
+			continue  # S1: loopback local exento de purga por red
+		if not transport.is_open():
+			dropped.append(transport)
+			continue
+		# S1: cliente conectado pero mudo 5 min => fuera (sesión fantasma).
+		if now - float(session.get("last_input_t", now)) > IDLE_KICK_SEC:
+			_log_cheat(int(session.get("id", 0)), "idle")
 			dropped.append(transport)
 	for t in dropped:
 		_drop_session(t)
+	# S3: purga de pendientes de auth (cerrados, o mudos tras el timeout).
+	var done: Array = []
+	for transport: NetTransport in _pending_auth.keys():
+		var entry: Dictionary = _pending_auth[transport]
+		transport.poll(delta)
+		if not transport.is_open():
+			done.append(transport)
+			continue
+		if now - float(entry.get("t", now)) > AUTH_TIMEOUT_SEC:
+			_log_cheat(0, "auth_timeout")
+			transport.close()
+			done.append(transport)
+	for t in done:
+		_drop_pending(t)
 
 
 func _drop_session(transport: NetTransport) -> void:
@@ -237,18 +340,240 @@ func _drop_session(transport: NetTransport) -> void:
 	var player: Player = session.get("player", null)
 	if player != null and is_instance_valid(player):
 		player.queue_free()
+	_histories.erase(int(session.get("id", -1)))  # S1: el historial no sobrevive a la sesión
 	_sessions.erase(transport)
 	transport.close()
 
 
 # ---------------------------------------------------------------
-# Punto 3: anti-cheat (rate-limit, plausibilidad, cheat-log) y lag-comp.
+# S3: cuentas (REGISTER/LOGIN emiten token; JOIN con token spawnea).
+# Sin token válido no hay jugador, y sin jugador no hay intents de juego:
+# los mensajes pre-auth que no sean auth se ignoran y a los 10 se cierra.
+
+static func _now_unix() -> int:
+	return int(Time.get_unix_time_from_system())
+
+
+func _on_pre_auth_message(msg: Dictionary, transport: NetTransport) -> void:
+	if not _pending_auth.has(transport):
+		return
+	if not NetMsg.is_valid_type(msg.get("type")):
+		return
+	var kind := str(msg.get("type", ""))
+	if kind != NetMsg.AUTH_REGISTER and kind != NetMsg.AUTH_LOGIN and kind != NetMsg.JOIN:
+		var entry: Dictionary = _pending_auth[transport]
+		entry["fails"] = int(entry.get("fails", 0)) + 1
+		if int(entry["fails"]) >= 10:
+			transport.close()  # la purga lo retira
+		return
+	var rl: RateLimiter = (_pending_auth[transport] as Dictionary)["rl"]
+	if not rl.consume(1.0, _now_sec()):
+		return  # silencioso: el timeout hará el resto
+	match kind:
+		NetMsg.AUTH_REGISTER:
+			_auth_do_register(msg, transport)
+		NetMsg.AUTH_LOGIN:
+			_auth_do_login(msg, transport)
+		NetMsg.JOIN:
+			_auth_do_join(msg, transport)
+
+
+func _auth_reply(transport: NetTransport, ok: bool, reason: String, token: String, callsign: String) -> void:
+	if not transport.is_open():
+		return
+	if ok:
+		transport.send({"type": NetMsg.AUTH_OK, "token": token, "callsign": callsign, "proto": NetMsg.PROTOCOL_VERSION})
+	else:
+		transport.send({"type": NetMsg.AUTH_FAIL, "reason": reason, "proto": NetMsg.PROTOCOL_VERSION})
+
+
+func _auth_do_register(msg: Dictionary, transport: NetTransport) -> void:
+	var raw_name: Variant = msg.get("callsign", "")
+	var raw_pw: Variant = msg.get("password", "")
+	if not (raw_name is String) or not (raw_pw is String):
+		_auth_reply(transport, false, "bad_payload", "", "")
+		return
+	var name: String = raw_name.strip_edges()
+	if not AuthService.valid_callsign(name):
+		_auth_reply(transport, false, "bad_name", "", "")
+		return
+	if (raw_pw as String).length() < PASSWORD_MIN_LEN:
+		_auth_reply(transport, false, "weak_password", "", "")
+		return
+	var key := AuthService.callsign_key(name)
+	if _users.has(key):
+		_auth_reply(transport, false, "taken", "", "")
+		return
+	var rec := AuthService.hash_password(raw_pw)
+	rec["callsign"] = name
+	rec["created"] = _now_unix()
+	_users[key] = rec
+	_auth_save()
+	_issue_token(transport, name)
+
+
+func _auth_do_login(msg: Dictionary, transport: NetTransport) -> void:
+	var raw_name: Variant = msg.get("callsign", "")
+	var raw_pw: Variant = msg.get("password", "")
+	if not (raw_name is String) or not (raw_pw is String):
+		_auth_reply(transport, false, "bad_payload", "", "")
+		return
+	var key := AuthService.callsign_key(raw_name)
+	# Mismo error exista o no (anti-enumeración), con bloqueo por intentos.
+	var fl: Dictionary = _failed.get(key, {})
+	if int(fl.get("until", 0)) > _now_unix():
+		_auth_reply(transport, false, "locked", "", "")
+		return
+	var rec: Dictionary = _users.get(key, {})
+	if rec.is_empty() or not AuthService.verify_password(raw_pw, rec):
+		var n := int(fl.get("n", 0)) + 1
+		var until := 0
+		if n >= MAX_LOGIN_FAILS:
+			until = _now_unix() + int(LOGIN_LOCK_SEC)
+		_failed[key] = {"n": n, "until": until}
+		_auth_reply(transport, false, "bad_credentials", "", "")
+		return
+	_failed.erase(key)
+	_issue_token(transport, str(rec["callsign"]))
+
+
+func _issue_token(transport: NetTransport, callsign: String) -> void:
+	var exp := _now_unix() + AuthService.TOKEN_TTL_SEC
+	var token := AuthService.make_token(_auth_secret(), callsign, exp)
+	_tokens[token] = {"callsign": callsign, "exp": exp}
+	_auth_reply(transport, true, "", token, callsign)
+
+
+func _auth_do_join(msg: Dictionary, transport: NetTransport) -> void:
+	if not _pending_auth.has(transport):
+		return
+	var raw_token: Variant = msg.get("token", "")
+	var raw_name: Variant = msg.get("callsign", "")
+	if not (raw_token is String) or not (raw_name is String):
+		_auth_reply(transport, false, "bad_payload", "", "")
+		return
+	var token: String = raw_token
+	var name: String = raw_name.strip_edges()
+	if token.length() > 256 or not AuthService.valid_callsign(name):
+		_auth_reply(transport, false, "bad_token", "", "")
+		return
+	if not _tokens.has(token):
+		_auth_reply(transport, false, "bad_token", "", "")
+		return
+	var ok := AuthService.check_token(_auth_secret(), token, name, _now_unix())
+	if ok.is_empty() or str((_tokens[token] as Dictionary).get("callsign", "")) != name:
+		_auth_reply(transport, false, "bad_token", "", "")
+		return
+	if count_net_players() >= MAX_NET_PLAYERS:
+		_auth_reply(transport, false, "full", "", "")
+		return
+	var player := _spawn_net_player()
+	if player == null:
+		_auth_reply(transport, false, "error", "", "")
+		return
+	_drop_pending(transport)  # suelta el callback pre-auth, el transport sigue abierto
+	attach_transport(transport, player, true)
+	var session: Dictionary = _sessions[transport]
+	transport.send(_welcome_msg(session["id"], player))
+
+
+## Secreto HMAC: de CLI/fichero o generado y persistido (sobrevive reinicios
+## para no invalidar tokens; proteger con chmod 600 en despliegue).
+func _auth_secret() -> PackedByteArray:
+	if not __auth_secret_cache.is_empty():
+		return __auth_secret_cache
+	if FileAccess.file_exists(_secret_path):
+		var f := FileAccess.open(_secret_path, FileAccess.READ)
+		if f != null:
+			var b := AuthService.hex_decode(f.get_line().strip_edges())
+			f.close()
+			if b.size() >= 32:
+				__auth_secret_cache = b
+				return __auth_secret_cache
+	var rng := RandomNumberGenerator.new()
+	rng.randomize()
+	var fresh := PackedByteArray()
+	fresh.resize(32)
+	for i in range(32):
+		fresh[i] = rng.randi() & 0xFF
+	var w := FileAccess.open(_secret_path, FileAccess.WRITE)
+	if w != null:
+		w.store_line(fresh.hex_encode())
+		w.close()
+	__auth_secret_cache = fresh
+	return __auth_secret_cache
+
+
+func _auth_load() -> void:
+	_users.clear()
+	if not FileAccess.file_exists(_users_path):
+		return
+	var f := FileAccess.open(_users_path, FileAccess.READ)
+	if f == null:
+		return
+	while not f.eof_reached():
+		var line := f.get_line().strip_edges()
+		if line.is_empty():
+			continue
+		var parsed: Variant = JSON.parse_string(line)
+		if parsed is Dictionary and (parsed as Dictionary).has("callsign"):
+			var key := AuthService.callsign_key(str((parsed as Dictionary)["callsign"]))
+			_users[key] = parsed
+	f.close()
+
+
+func _auth_save() -> void:
+	var f := FileAccess.open(_users_path, FileAccess.WRITE)
+	if f == null:
+		push_warning("Auth: no se pudo escribir %s" % _users_path)
+		return
+	for key in _users:
+		f.store_line(JSON.stringify(_users[key]))
+	f.close()
 # El cliente nunca decide resultados; aquí solo se valida el ritmo y la
 # cordura de sus intenciones. Los hits los resuelve el servidor con su
 # propio estado; el historial rebobinado mide la divergencia (telemetría).
 
 static func _now_sec() -> float:
 	return Time.get_ticks_msec() / 1000.0
+
+
+## S1: coerciones seguras. Un Variant atacante nunca debe llegar a una
+## asignación tipada ni a una API que espera un tipo concreto: si el tipo no
+## es el esperado se devuelve el fallback (los handlers críticos además
+## cuentan strike con "bad_payload:<tipo>").
+static func _as_int(v: Variant, fallback: int) -> int:
+	if v is int:
+		return v
+	if v is float and is_finite(v):
+		return int(v)
+	return fallback
+
+
+static func _as_float(v: Variant, fallback: float) -> float:
+	if v is float and is_finite(v):
+		return v
+	if v is int:
+		return float(v)
+	return fallback
+
+
+## Path de pickup: String corta con caracteres de ruta relativa seguros.
+## Se acepta `@` porque Godot autonombra nodos como `@Pickup@4`.
+static func _as_safe_path(v: Variant) -> String:
+	if not (v is String):
+		return ""
+	var s: String = v
+	if s.is_empty() or s.length() > MAX_PATH_LEN:
+		return ""
+	var re := RegEx.new()
+	if re.compile("^[A-Za-z0-9_\\-/.@]+$") != OK:
+		return ""
+	if re.search(s) == null:
+		return ""
+	if s.begins_with("/") or s.contains(".."):
+		return ""
+	return s
 
 
 static func _new_limiters() -> Dictionary:
@@ -337,71 +662,125 @@ func _on_transport_message(msg: Dictionary, transport: NetTransport) -> void:
 	if not NetMsg.is_valid_type(msg.get("type")):
 		push_warning("Mensaje con tipo inválido desechado: %s" % msg)
 		return
+	# S1: por este dispatcher solo entran INTENTS (cliente->servidor).
+	# Un EVENTO aquí es eco del propio broadcast en loopback: se ignora
+	# antes de puertas y rate-limit (si no, el servidor se dropearía a sí mismo).
+	if not NetMsg.is_intent(msg.get("type")):
+		return
+	# S1: las sesiones de red exigen versión exacta de protocolo.
+	# Sin coincidencia no hay partida: se dropea (el loopback local es tolerante).
+	if bool(session.get("net", false)):
+		if _as_int(msg.get("proto", -1), -1) != NetMsg.PROTOCOL_VERSION:
+			_log_cheat(int(session.get("id", 0)), "proto")
+			_drop_session(transport)
+			return
+	# S1: anti-replay. seq>0 debe ser estrictamente creciente; t>0 debe ser
+	# monótono con holgura de reorden. seq/t ausentes (0) = llamada local
+	# legada: se acepta sin chequeo pero con rate-limit igualmente.
+	var seq := _as_int(msg.get("seq", 0), 0)
+	if seq > 0:
+		if seq <= int(session.get("last_seq", 0)):
+			_strike(session, transport, "replay")
+			return
+		session["last_seq"] = seq
+		var t := _as_int(msg.get("t", 0), 0)
+		if t > 0:
+			var last_t := int(session.get("last_t", 0))
+			if last_t > 0 and t < last_t - REORDER_SLACK_MS:
+				_strike(session, transport, "replay_time")
+				return
+			session["last_t"] = maxi(last_t, t)
 	# Punto 3: seq + rate-limit antes de despachar. El flood persistente
 	# termina en kick; cada rechazo queda en el cheat_log.
-	var seq := int(msg.get("seq", 0))
-	if seq > int(session.get("last_seq", 0)):
-		session["last_seq"] = seq
 	if not _check_rate(session, transport, str(msg["type"])):
 		return
+	session["last_input_t"] = _now_sec()
 	match msg["type"]:
 		NetMsg.FIRE:
-			_handle_fire(player, msg)
+			_handle_fire(player, msg, session, transport)
 		NetMsg.RELOAD:
-			_handle_reload(player, msg)
+			_handle_reload(player, msg, session, transport)
 		NetMsg.BUILD_PLACE:
-			request_build_place(world_grid, msg.get("cell", Vector2i.ZERO), player.team_id, player.global_position)
+			_handle_build_place(player, msg, session, transport)
 		NetMsg.BUILD_DESTROY:
-			request_build_destroy(world_grid, msg.get("cell", Vector2i.ZERO), player.team_id, player.global_position)
+			_handle_build_destroy(player, msg, session, transport)
 		NetMsg.PICKUP_CLAIM:
-			_handle_pickup_claim(player, msg)
+			_handle_pickup_claim(player, msg, session, transport)
 		NetMsg.FALL_OUT:
 			request_fall_out(player)
 		NetMsg.MOVE:
 			_handle_move(player, msg)
 		NetMsg.UTILITY:
-			_handle_utility(player, msg)
+			_handle_utility(player, msg, session, transport)
 
 
-func _handle_fire(player: Player, msg: Dictionary) -> void:
-	var index: int = msg.get("weapon_index", -1)
+func _handle_fire(player: Player, msg: Dictionary, session: Dictionary, transport: NetTransport) -> void:
+	var index := _as_int(msg.get("weapon_index", -1), -1)
 	if index < 0 or index >= player.weapons.size():
+		_strike(session, transport, "bad_payload:fire")
 		return
-	var dir: Vector2 = msg.get("direction", Vector2.ZERO)
+	var raw_dir: Variant = msg.get("direction", Vector2.ZERO)
+	if not (raw_dir is Vector2):
+		_strike(session, transport, "bad_payload:fire")
+		return
+	var dir: Vector2 = raw_dir
 	if not is_finite(dir.x) or not is_finite(dir.y):
 		return
 	if dir.is_zero_approx():
 		return
 	dir = dir.normalized()  # el servidor nunca confía en el módulo del vector cliente
 	var src := player.weapon_arm.global_position + dir * 10.0
-	request_fire(player, player.weapons[index], src, dir, int(msg.get("ftick", -1)))
+	request_fire(player, player.weapons[index], src, dir, _as_int(msg.get("ftick", -1), -1))
 
 
-func _handle_reload(player: Player, msg: Dictionary) -> void:
-	var index: int = msg.get("weapon_index", -1)
+func _handle_reload(player: Player, msg: Dictionary, session: Dictionary, transport: NetTransport) -> void:
+	var index := _as_int(msg.get("weapon_index", -1), -1)
 	if index < 0 or index >= player.weapons.size():
+		_strike(session, transport, "bad_payload:reload")
 		return
 	request_reload(player, player.weapons[index])
 
 
-func _handle_pickup_claim(player: Player, msg: Dictionary) -> void:
+func _handle_build_place(player: Player, msg: Dictionary, session: Dictionary, transport: NetTransport) -> void:
+	var raw_cell: Variant = msg.get("cell", Vector2i.ZERO)
+	if not (raw_cell is Vector2i):
+		_strike(session, transport, "bad_payload:build")
+		return
+	request_build_place(world_grid, raw_cell, player.team_id, player.global_position)
+
+
+func _handle_build_destroy(player: Player, msg: Dictionary, session: Dictionary, transport: NetTransport) -> void:
+	var raw_cell: Variant = msg.get("cell", Vector2i.ZERO)
+	if not (raw_cell is Vector2i):
+		_strike(session, transport, "bad_payload:build")
+		return
+	request_build_destroy(world_grid, raw_cell, player.team_id, player.global_position)
+
+
+func _handle_pickup_claim(player: Player, msg: Dictionary, session: Dictionary, transport: NetTransport) -> void:
 	# El path es relativo al mundo registrado (TestMap u otro contenedor de test).
+	# S1: el path se valida SIEMPRE (incluso sin mundo), para que el garbage
+	# remoto nunca llegue a NodePath/get_node_or_null.
+	var path := _as_safe_path(msg.get("path", ""))
+	if path.is_empty():
+		_strike(session, transport, "bad_payload:pickup")
+		return
 	if world == null or not is_instance_valid(world):
 		return
-	var node := world.get_node_or_null(NodePath(msg.get("path", "")))
+	var node := world.get_node_or_null(NodePath(path))
 	if node is Pickup:
 		if request_pickup(player, node):
-			_broadcast_event({"type": NetMsg.PICKUP_CONSUMED, "path": msg.get("path", "")})
+			_broadcast_event({"type": NetMsg.PICKUP_CONSUMED, "path": path})
 
 
 func _handle_move(player: Player, msg: Dictionary) -> void:
 	if not player.use_net_input:
 		return
-	player.net_axis = clampf(float(msg.get("axis", 0.0)), -1.0, 1.0)
+	player.net_axis = clampf(_as_float(msg.get("axis", 0.0), 0.0), -1.0, 1.0)
 	if bool(msg.get("jump_edge", false)):
 		player.net_jump_edge = true
 	player.net_crouch = bool(msg.get("crouch", false))
-	var aim := float(msg.get("aim", player.aim_angle))
+	var aim := fmod(_as_float(msg.get("aim", player.aim_angle), player.aim_angle), TAU)
 	if not is_finite(aim):
 		return
 	player.aim_angle = aim
@@ -410,8 +789,12 @@ func _handle_move(player: Player, msg: Dictionary) -> void:
 	player.weapon_arm.scale.y = scale_val
 
 
-func _handle_utility(player: Player, msg: Dictionary) -> void:
-	var dir: Vector2 = msg.get("direction", Vector2.RIGHT)
+func _handle_utility(player: Player, msg: Dictionary, session: Dictionary, transport: NetTransport) -> void:
+	var raw_dir: Variant = msg.get("direction", Vector2.RIGHT)
+	if not (raw_dir is Vector2):
+		_strike(session, transport, "bad_payload:utility")
+		return
+	var dir: Vector2 = raw_dir
 	if not is_finite(dir.x) or not is_finite(dir.y):
 		return
 	request_utility(player, dir)

@@ -11,6 +11,18 @@ var history_path := "user://matches.jsonl"
 
 var callsign := "Rookie"
 var client_id := ""
+var auth_token := ""  # S3: token de sesión (se renueva en cada AUTH_OK)
+
+
+func clear_auth_token() -> void:
+	auth_token = ""
+	_save_profile()
+
+
+## Guarda el token de sesión (persistido para auto-JOIN).
+func set_auth_token(value: String) -> void:
+	auth_token = value
+	_save_profile()
 
 
 func _ready() -> void:
@@ -118,6 +130,7 @@ func _load_profile() -> void:
 	if cfg.load(profile_path) == OK:
 		callsign = str(cfg.get_value("profile", "callsign", callsign))
 		client_id = str(cfg.get_value("profile", "client_id", ""))
+		auth_token = str(cfg.get_value("auth", "token", ""))
 
 
 func _save_profile() -> void:
@@ -127,4 +140,5 @@ func _save_profile() -> void:
 	if client_id == "":
 		client_id = "%d-%d" % [Time.get_unix_time_from_system(), randi() % 100000]
 	cfg.set_value("profile", "client_id", client_id)
+	cfg.set_value("auth", "token", auth_token)
 	cfg.save(profile_path)

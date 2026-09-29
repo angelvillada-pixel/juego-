@@ -26,7 +26,7 @@ func _on_body_entered(body: Node) -> void:
 	var map := _find_map_ancestor()
 	if map == null:
 		return
-	Client.send({"type": NetMsg.PICKUP_CLAIM, "path": str(map.get_path_to(self))})
+	NetMsg.send_intent({"type": NetMsg.PICKUP_CLAIM, "path": str(map.get_path_to(self))})
 
 
 func _find_map_ancestor() -> Node:

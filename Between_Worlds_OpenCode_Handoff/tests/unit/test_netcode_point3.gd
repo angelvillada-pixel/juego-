@@ -96,7 +96,7 @@ func run(ctx: Object) -> void:
 	var t3 := LocalTransport.new()
 	server.attach_transport(t3, p3, true)
 	var snap_id: int = server._sessions[t3]["id"]
-	t3.send({"type": NetMsg.MOVE, "axis": 0.0, "jump_edge": false, "crouch": false, "aim": 0.0, "seq": 11})
+	t3.send({"type": NetMsg.MOVE, "axis": 0.0, "jump_edge": false, "crouch": false, "aim": 0.0, "seq": 11, "proto": NetMsg.PROTOCOL_VERSION})
 	var snaps := []
 	t3.message_received.connect(func(m: Dictionary) -> void: snaps.append(m))
 	server._broadcast_snapshot()

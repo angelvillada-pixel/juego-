@@ -1,0 +1,56 @@
+# Between Worlds — compose de producción (game + TLS).
+# Uso: cp .env.example .env  # y rellenar DOMAIN/EMAIL
+#      docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+# El puerto del juego (26500) queda atado a 127.0.0.1 del host: internet
+# solo entra por 80/443 vía Caddy (wss:// obligatorio).
+
+services:
+  game:
+    build: ..
+    # P3-P5: en CI-deploy se fija BW_IMAGE (GHCR); en local se usa build.
+    image: ${BW_IMAGE:-bw-game:local}
+    command: ["--port=26500", "--bind=0.0.0.0", "--mode=frontline", "--map=lab"]
+    ports:
+      - "127.0.0.1:26500:26500"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # Sonda TCP (liveness): el handshake WS lo valida el propio juego.
+      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/127.0.0.1/26500' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    volumes:
+      # user:// del servidor (telemetría, perfil): sobrevive a redespliegues.
+      - bw-data:/home/bw/.local/share/godot/app_userdata/Between Worlds
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      DOMAIN: ${DOMAIN}
+      EMAIL: ${EMAIL}
+    restart: unless-stopped
+    depends_on:
+      - game
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bw-data:
+  caddy-data:
+  caddy-config:

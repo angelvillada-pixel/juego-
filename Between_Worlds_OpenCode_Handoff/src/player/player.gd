@@ -105,7 +105,7 @@ func _tick_utility_cooldown(delta: float) -> void:
 func try_utility() -> void:
 	if not can_use_utility():
 		return
-	Client.send({"type": NetMsg.UTILITY, "direction": Vector2.from_angle(aim_angle), "ftick": Client.peer_tick})
+	NetMsg.send_intent({"type": NetMsg.UTILITY, "direction": Vector2.from_angle(aim_angle), "ftick": NetMsg.client_peer_tick()})
 
 
 ## Efecto autoritativo del Dash: impulso horizontal en la dirección pedida.
@@ -138,11 +138,11 @@ func offhand_weapon() -> Weapon:
 func _fire_active_weapon() -> void:
 	if active_weapon() == null:
 		return
-	Client.send({
+	NetMsg.send_intent({
 		"type": NetMsg.FIRE,
 		"weapon_index": active_weapon_index,
 		"direction": Vector2.from_angle(aim_angle),
-		"ftick": Client.peer_tick,
+		"ftick": NetMsg.client_peer_tick(),
 	})
 
 
@@ -150,11 +150,11 @@ func _fire_offhand_weapon() -> void:
 	var idx := 1 if active_weapon_index == 0 else 0
 	if weapons.size() <= idx:
 		return
-	Client.send({
+	NetMsg.send_intent({
 		"type": NetMsg.FIRE,
 		"weapon_index": idx,
 		"direction": Vector2.from_angle(aim_angle),
-		"ftick": Client.peer_tick,
+		"ftick": NetMsg.client_peer_tick(),
 	})
 
 
@@ -218,7 +218,7 @@ func apply_pickup(pickup_id: String) -> void:
 
 
 func try_reload_active() -> void:
-	Client.send({"type": NetMsg.RELOAD, "weapon_index": active_weapon_index})
+	NetMsg.send_intent({"type": NetMsg.RELOAD, "weapon_index": active_weapon_index})
 
 
 func _on_weapon_ammo_changed(_magazine: int, _reserve: int, weapon: Weapon) -> void:

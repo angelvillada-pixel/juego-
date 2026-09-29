@@ -1,5 +1,87 @@
 # Between Worlds — Verification Log
 
+## P3-P5 — Operación 24/7 (2026-09-29, Godot 4.7.2 + Docker 29.6.2)
+
+### Cambios
+- `ci.yml` (path + workflow_call), `deploy.yml` nuevo, `.dockerignore` nuevo.
+- Compose: `BW_IMAGE`, logging 10m x3. `watchdog.sh` + `backup.sh` nuevos.
+- `DEPLOY.md`: watchdog/backup/deploy/secrets. Presets: header verificado.
+
+### Verificación
+- `docker compose config` OK tras cada cambio.
+- `bash -n` OK en ambos scripts. E2E de backup pendiente (daemon Docker parado en esta máquina).
+- Exports reales: Linux 73 MB + Web completo + Windows 109 MB, cero errores.
+- Suite final (ver abajo).
+
+---
+
+## S3 — Cuentas completas (2026-09-29, Godot 4.7.2 win64 + openssl)
+
+### Cambios
+- `src/auth/auth_service.gd` nuevo (HMAC/PBKDF2/tokens/callsigns, puro).
+- `NetMsg`: `AUTH_REGISTER/AUTH_LOGIN/JOIN` + `AUTH_OK/AUTH_FAIL`.
+- `game_server.gd`: pendientes-auth, registro/login/JOIN, lockout, secreto y usuarios en fichero.
+- `net_client.gd`: flujo token→JOIN si no LOGIN/REGISTER→JOIN; `auth_failed`.
+- `menu.gd`/`main.gd`: password + Login/Register; `Backend`: token persistido.
+- `tests/smoke_join.gd`: flujo con auth.
+
+### Verificación
+- Suite → **PASSED: 1059, FAILED: 0** (31 checks S3).
+- Cripto contra openssl: HMAC-SHA256 y PBKDF2 c=1 idénticos (mi memoria de los vectores RFC estaba mal en la cola; el código, bien). Cazado además: `PackedByteArray` se aliasa al pasar como arg (duplicar antes de rellenar) y `from_hex` no existe en 4.7 (usar `hex_decode` propio).
+- Smoke real con auth → REGISTER→AUTH_OK→JOIN→WELCOME→SNAPSHOT, exit 0, servidor limpio.
+
+---
+
+## P1-P2 — Docker 24/7 + jugable online (2026-09-29, Godot 4.7.2 win64)
+
+### Cambios
+- `NetMsg.send_intent()` + `NetMsg.client_peer_tick()` (sin refs estáticas a autoloads); `player.gd`/`pickup.gd` migrados.
+- `server_main.gd`: arranque en `_boot()` (primer frame) + misma regla anti-autoload.
+- `tests/smoke_join.gd` nuevo (manual): WELCOME proto + SNAPSHOT con id.
+- `docs/VPS_GRATIS.md` nuevo; `deploy/docker-compose.yml` validado con `docker compose config`.
+
+### Verificación
+- Dedicado real en puerto 26601: boot limpio, 16 objetivos, listener en 127.0.0.1.
+- Smoke → `OK: snapshot contiene a id=1`, exit 0; servidor sin errores ni strikes.
+- Suite completa tras los cambios (ver abajo).
+
+---
+
+## S2 — TLS delante del juego (2026-09-29, Godot 4.7.2 win64)
+
+### Cambios
+- `game_server.gd`: `start_listener(port, bind="127.0.0.1")` + budget de aceptadas 10/10 s con log `accept_flood` ≤1/s.
+- `server_main.gd`: flag CLI `--bind=` (defecto localhost).
+- `ws_transport.gd`: `normalize_url` + `is_secure`; `net_client.gd` rehúsa `ws://` en web.
+- `Dockerfile`: CMD con `--bind=0.0.0.0` (red interna de compose) + aviso de no exponer 26500.
+- `deploy/`: `Caddyfile` (TLS auto, HSTS, gzip, reverse_proxy), `docker-compose.yml` (restart unless-stopped, healthcheck TCP, volumen datos), `.env.example`.
+- `DEPLOY.md`: flujos local / LAN / producción TLS.
+- Tests: `test_security_s2.gd` nuevo (12 checks: URLs, bind+stop, ráfaga de aceptadas).
+
+### Verificación
+- `--headless --path . --quit` → EXIT=0, cero errores.
+- Suite → **PASSED: 1028, FAILED: 0**.
+- Sin verificar con binario: handshake TLS real contra Caddy (requiere VPS + dominio).
+
+---
+
+## S1 — Endurecimiento de entrada (2026-09-29, Godot 4.7.2 win64)
+
+### Cambios
+- `NetMsg.PROTOCOL_VERSION = 1` (sellado en `Client.send`, anunciado en `WELCOME`, verificado con warning en `NetClientDriver`); sesiones de red sin coincidencia => drop.
+- Puertas en `_on_transport_message`: anti-replay (`seq` estrictamente creciente, `t` monótona ±1000 ms), rate-limit existente, `last_input_t`.
+- Payloads tipados en los 6 handlers (`is Vector2/Vector2i`, int en rango, path ≤128 con whitelist + `@`, `aim` con `fmod`); violación => `bad_payload:<tipo>`.
+- `_pending_peers` como `{ws, t}` con cap 16 + timeout 10 s (`prune_pending` estático).
+- `_histories` se borra al dropear/limpiar; idle kick 300 s solo-red; eventos entrantes se ignoran (eco loopback).
+- Tests: `tests/unit/test_security_s1.gd` nuevo (21 checks); `test_netcode_point3.gd` actualizado (proto en sesión net).
+
+### Verificación
+- `--headless --path . --quit` → EXIT=0, cero errores.
+- Suite → **PASSED: 1016, FAILED: 0** (19 suites + S1).
+- Bugs cazados por la suite: whitelist rechazaba `@` de autonombres Godot; validación de path corría tras el check de mundo; eco del SNAPSHOT se autodropeaba la sesión (fix: ignorar eventos entrantes).
+
+---
+
 ## Verificación real — Puntos 1-5 (2026-09-29, Godot 4.7.2 win64)
 
 ### Entorno

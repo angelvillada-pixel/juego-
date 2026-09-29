@@ -35,6 +35,8 @@ func send(msg: Dictionary) -> bool:
 		_next_seq += 1
 	if not msg.has("t"):
 		msg["t"] = Time.get_ticks_msec()
+	if not msg.has("proto"):
+		msg["proto"] = NetMsg.PROTOCOL_VERSION
 	_send_times[int(msg["seq"])] = int(msg["t"])
 	sent_count += 1
 	transport.send(msg)

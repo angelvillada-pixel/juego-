@@ -6,7 +6,7 @@ extends Control
 ## (se elige antes de spawnear).
 
 signal start_requested(mode_id: String, armor_id: String, map_id: String)
-signal join_requested(address: String)
+signal join_requested(address: String, callsign: String, password: String, do_register: bool)
 
 var mode_opt: OptionButton
 var armor_opt: OptionButton
@@ -14,6 +14,8 @@ var map_opt: OptionButton
 var sfx_slider: HSlider
 var music_slider: HSlider
 var callsign_edit: LineEdit
+var password_edit: LineEdit
+var auth_opt: OptionButton
 var address_edit: LineEdit
 
 
@@ -60,6 +62,9 @@ func _ready() -> void:
 
 	callsign_edit = _labeled_edit(box, "Callsign", 16)
 	callsign_edit.text = Backend.get_callsign()
+	password_edit = _labeled_edit(box, "Password", 64)
+	password_edit.secret = true
+	auth_opt = _labeled_option(box, "Account", ["login", "register"])
 	address_edit = _labeled_edit(box, "Server", 64)
 	var recents: Array = Backend.get_recents()
 	address_edit.text = str(recents[0]) if not recents.is_empty() else ""
@@ -160,11 +165,15 @@ func _on_start() -> void:
 	emit_signal("start_requested", selected_mode(), selected_armor(), selected_map())
 
 
+func selected_auth_register() -> bool:
+	return str(auth_opt.get_item_metadata(auth_opt.selected)) == "register"
+
+
 func _on_join() -> void:
 	apply_volumes()
 	Backend.set_callsign(callsign_edit.text)
 	Backend.add_recent(address_edit.text)
-	emit_signal("join_requested", address_edit.text.strip_edges())
+	emit_signal("join_requested", address_edit.text.strip_edges(), callsign_edit.text.strip_edges(), password_edit.text, selected_auth_register())
 
 
 func _unhandled_input(event: InputEvent) -> void:

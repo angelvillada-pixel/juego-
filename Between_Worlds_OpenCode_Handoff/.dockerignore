@@ -1,0 +1,7 @@
+# P3-P5: el contexto de build no debe llevarse la caché del editor ni dist.
+.godot/
+dist/
+*.tmp
+nul
+user/
+Temp/

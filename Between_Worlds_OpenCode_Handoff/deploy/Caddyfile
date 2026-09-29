@@ -1,0 +1,22 @@
+# Between Worlds — Caddy (terminación TLS para wss://).
+# Copiar .env.example a .env y poner DOMAIN + EMAIL. Caddy obtiene y renueva
+# el certificado solo (Let's Encrypt) y proxea al servidor Godot en localhost.
+# El puerto 26500 NUNCA se expone a internet (ver docker-compose.yml).
+
+{$DOMAIN} {
+	tls {$EMAIL}
+
+	encode gzip
+
+	# Juego: wss://DOMAIN -> ws://game:26500 (Godot escucha en 0.0.0.0
+	# dentro de su contenedor; el host solo publica 80/443).
+	reverse_proxy game:26500
+
+	# Cabeceras duras para el futuro cliente web estático.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		-Server
+	}
+}

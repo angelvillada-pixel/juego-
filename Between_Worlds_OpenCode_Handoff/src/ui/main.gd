@@ -12,6 +12,11 @@ var construction: ConstructionController
 var net_driver: NetClientDriver = null
 var menu: GameMenu = null
 var started := false
+# S3: credenciales pendientes para el driver de red (el password se limpia
+# justo después de pasarlo).
+var _pending_callsign := ""
+var _pending_password := ""
+var _pending_register := false
 
 @onready var world: Node2D = $World
 @onready var entities: Node2D = $Entities
@@ -71,10 +76,19 @@ func _start_match(mode: String, armor: String, map: String, force_url: String = 
 
 
 ## Unirse a un servidor remoto desde el menú (matchmaking manual, Punto 5).
-func _on_join(address: String) -> void:
+## S3: con cuenta (login o registro según el menú).
+func _on_join(address: String, callsign: String, password: String, do_register: bool) -> void:
 	if address == "":
 		return
+	_pending_callsign = callsign
+	_pending_password = password
+	_pending_register = do_register
 	_start_match(menu.selected_mode(), menu.selected_armor(), menu.selected_map(), address)
+
+
+func _on_auth_failed(reason: String) -> void:
+	Audio.play("lose")
+	hud.round_label.text = "Auth failed (%s).\nPress Enter to retry." % reason
 
 
 func _build_world(map: String) -> void:
@@ -197,7 +211,9 @@ func _setup_transport(force_url: String = "") -> void:
 	if url != "":
 		net_driver = NetClientDriver.new()
 		entities.add_child(net_driver)
-		net_driver.setup(player, test_map, Match)
+		net_driver.setup(player, test_map, Match, _pending_callsign, _pending_password, _pending_register)
+		_pending_password = ""
+		net_driver.auth_failed.connect(_on_auth_failed)
 		net_driver.connect_to(url)
 		return
 	var transport := LocalTransport.new()

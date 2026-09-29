@@ -37,6 +37,9 @@ func _run_all() -> void:
 		"res://tests/unit/test_maps.gd",
 		"res://tests/unit/test_telemetry.gd",
 		"res://tests/unit/test_backend.gd",
+		"res://tests/unit/test_security_s1.gd",
+		"res://tests/unit/test_security_s2.gd",
+		"res://tests/unit/test_auth_s3.gd",
 	]
 	print("\n========== Between Worlds — Unit Tests ==========")
 	for path in test_scripts:
